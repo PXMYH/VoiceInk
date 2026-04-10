@@ -1,0 +1,127 @@
+name: Sync Upstream Release
+
+on:
+  schedule:
+    - cron: '0 0 1,15 * *' # 1st and 15th of each month (~every 15 days)
+  workflow_dispatch: # Manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-patch:
+    runs-on: macos-15
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select latest Xcode
+        run: |
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using: $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          xcodebuild -version
+          swift --version
+
+      - name: Check for new upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh api repos/Beingpax/VoiceInk/releases/latest --jq .tag_name)
+
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            echo "ERROR: Could not fetch latest upstream release tag"
+            exit 1
+          fi
+
+          echo "upstream_tag=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: ${LATEST}"
+
+          if git tag -l "patched-${LATEST}" | grep -q .; then
+            echo "new_release=false" >> "$GITHUB_OUTPUT"
+            echo "Already patched ${LATEST}, skipping."
+          else
+            echo "new_release=true" >> "$GITHUB_OUTPUT"
+            echo "New release found: ${LATEST}"
+          fi
+
+      - name: Sync fork to upstream release
+        if: steps.check.outputs.new_release == 'true'
+        env:
+          TAG: ${{ steps.check.outputs.upstream_tag }}
+        run: |
+          # Save our custom files before reset
+          mkdir -p /tmp/fork-custom
+          cp -r .github /tmp/fork-custom/
+          cp -r scripts /tmp/fork-custom/
+
+          # Fetch upstream and reset to release tag
+          git remote add upstream https://github.com/Beingpax/VoiceInk.git
+          git fetch upstream --tags
+          git reset --hard "${TAG}"
+
+          # Restore our custom files
+          cp -r /tmp/fork-custom/.github .
+          cp -r /tmp/fork-custom/scripts .
+
+      - name: Apply license patch
+        if: steps.check.outputs.new_release == 'true'
+        run: python3 scripts/patch-license.py
+
+      - name: Commit, tag, and push
+        if: steps.check.outputs.new_release == 'true'
+        env:
+          TAG: ${{ steps.check.outputs.upstream_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git commit -m "Sync to upstream ${TAG} + remove license restriction"
+          git tag "patched-${TAG}"
+
+          git push --force origin main
+          git push origin "patched-${TAG}"
+
+      - name: Build VoiceInk.app
+        if: steps.check.outputs.new_release == 'true'
+        run: make local
+
+      - name: Package app
+        if: steps.check.outputs.new_release == 'true'
+        env:
+          TAG: ${{ steps.check.outputs.upstream_tag }}
+        run: |
+          APP_PATH=".local-build/Build/Products/Debug/VoiceInk.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "ERROR: VoiceInk.app not found at $APP_PATH"
+            exit 1
+          fi
+          ditto -c -k --keepParent "$APP_PATH" "VoiceInk-${TAG}.zip"
+          echo "Packaged VoiceInk-${TAG}.zip ($(du -h "VoiceInk-${TAG}.zip" | cut -f1))"
+
+      - name: Create GitHub release with app
+        if: steps.check.outputs.new_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.check.outputs.upstream_tag }}
+        run: |
+          gh release create "patched-${TAG}" \
+            --repo "${{ github.repository }}" \
+            --title "Patched ${TAG}" \
+            --notes "$(cat <<'NOTES'
+          Auto-synced from upstream with license restriction removed.
+
+          ## Install
+          1. Download **VoiceInk.zip** below
+          2. Unzip and move **VoiceInk.app** to /Applications
+          3. Right-click → Open (first launch only, to bypass Gatekeeper)
+
+          **Note:** Local builds have no iCloud dictionary sync.
+          NOTES
+          )" \
+            "VoiceInk-${TAG}.zip"
