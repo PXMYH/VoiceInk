@@ -1,0 +1,136 @@
+name: Sync Upstream Main
+
+on:
+  schedule:
+    - cron: '0 8 * * 1' # Mondays 08:00 UTC
+  workflow_dispatch: # Manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-patch:
+    runs-on: macos-15
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select latest Xcode
+        run: |
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using: $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          xcodebuild -version
+          swift --version
+
+      - name: Check for new upstream main commit
+        id: check
+        run: |
+          git remote add upstream https://github.com/Beingpax/VoiceInk.git
+          git fetch upstream main --quiet
+
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          SHORT="${UPSTREAM_SHA:0:7}"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "Upstream main is at: ${SHORT}"
+
+          # Dedup: skip if we already published a release for this exact commit
+          if git ls-remote --exit-code --tags origin "refs/tags/patched-main-${SHORT}" >/dev/null 2>&1; then
+            echo "new_commit=false" >> "$GITHUB_OUTPUT"
+            echo "Already patched main@${SHORT}, skipping."
+          else
+            echo "new_commit=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream commit found: ${SHORT}"
+          fi
+
+      - name: Sync fork to upstream main
+        if: steps.check.outputs.new_commit == 'true'
+        run: |
+          # Save our custom files before reset
+          mkdir -p /tmp/fork-custom
+          cp -r .github /tmp/fork-custom/
+          cp -r scripts /tmp/fork-custom/
+
+          # Reset to upstream main HEAD
+          git reset --hard upstream/main
+
+          # Restore our custom files
+          cp -r /tmp/fork-custom/.github .
+          cp -r /tmp/fork-custom/scripts .
+
+      - name: Apply license patch
+        if: steps.check.outputs.new_commit == 'true'
+        run: python3 scripts/patch-license.py
+
+      - name: Commit, tag, and push
+        if: steps.check.outputs.new_commit == 'true'
+        env:
+          SHORT: ${{ steps.check.outputs.short_sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git commit -m "Sync to upstream main (${SHORT}) + remove license restriction"
+          git tag "patched-main-${SHORT}"
+
+          git push --force origin main
+          git push origin "patched-main-${SHORT}"
+
+      # Caches the whisper.cpp xcframework so weekly runs don't rebuild the
+      # multi-GB dependency every time. Bump the key suffix (v1 -> v2) to force a
+      # fresh whisper.cpp build (e.g. after upstream bumps the whisper version).
+      - name: Cache whisper.cpp xcframework
+        if: steps.check.outputs.new_commit == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/VoiceInk-Dependencies
+          key: whisper-xcframework-v1
+
+      - name: Build VoiceInk.app
+        if: steps.check.outputs.new_commit == 'true'
+        run: make local
+
+      - name: Package app
+        if: steps.check.outputs.new_commit == 'true'
+        env:
+          SHORT: ${{ steps.check.outputs.short_sha }}
+        run: |
+          APP_PATH=".local-build/Build/Products/Debug/VoiceInk.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "ERROR: VoiceInk.app not found at $APP_PATH"
+            exit 1
+          fi
+          ditto -c -k --keepParent "$APP_PATH" "VoiceInk-main-${SHORT}.zip"
+          echo "Packaged VoiceInk-main-${SHORT}.zip ($(du -h "VoiceInk-main-${SHORT}.zip" | cut -f1))"
+
+      - name: Create GitHub release with app
+        if: steps.check.outputs.new_commit == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHORT: ${{ steps.check.outputs.short_sha }}
+          UPSTREAM_SHA: ${{ steps.check.outputs.upstream_sha }}
+          DATE: ${{ steps.check.outputs.date }}
+        run: |
+          gh release create "patched-main-${SHORT}" \
+            --repo "${{ github.repository }}" \
+            --title "Patched main ${DATE} (${SHORT})" \
+            --notes "$(cat <<NOTES
+          Auto-synced from upstream **main** (\`${UPSTREAM_SHA}\`) with license restriction removed.
+
+          Tracks upstream main HEAD weekly — includes unreleased features ahead of the latest tagged release.
+
+          ## Install
+          1. Download **VoiceInk-main-${SHORT}.zip** below
+          2. Unzip and move **VoiceInk.app** to /Applications
+          3. Right-click - Open (first launch only, to bypass Gatekeeper)
+
+          **Note:** Local builds have no iCloud dictionary sync.
+          NOTES
+          )" \
+            "VoiceInk-main-${SHORT}.zip"
